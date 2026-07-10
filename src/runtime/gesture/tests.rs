@@ -14,6 +14,9 @@ fn timing(drag_end_delay_ms: u64) -> Timing {
         drag_end_delay: Duration::from_millis(drag_end_delay_ms),
         press_grace: Duration::from_millis(75),
         px_per_mm: PX_PER_MM,
+        // 0.1mm = 1 unit at RES: small enough that the existing motion
+        // tests arm on their first move, big enough to prove the deadzone.
+        drag_start_mm: 0.1,
     }
 }
 
@@ -30,6 +33,17 @@ impl Sim {
     fn with_delay(drag_end_delay_ms: u64) -> Self {
         Sim {
             m: GestureMachine::new(timing(drag_end_delay_ms), RES, RES, 16),
+            now: Instant::now(),
+        }
+    }
+    /// A sim with a chosen device resolution and drag-start deadzone --
+    /// used to exercise sub-threshold finger jitter at a fine enough
+    /// resolution that integer positions land well inside the deadzone.
+    fn with_res_threshold(res: f64, drag_start_mm: f64) -> Self {
+        let mut t = timing(0);
+        t.drag_start_mm = drag_start_mm;
+        Sim {
+            m: GestureMachine::new(t, res, res, 16),
             now: Instant::now(),
         }
     }
@@ -126,9 +140,11 @@ fn collect(mut acc: Vec<Output>, more: Vec<Output>) -> Vec<Output> {
 /// callers depend on. Returns everything emitted along the way.
 fn start_drag(sim: &mut Sim) -> Vec<Output> {
     let mut outs = commit_drag_only(sim);
-    // baseline is at x=500 (the touchdown position); +1 unit then -1 unit
-    // presses on the first motion and leaves the baseline back at 500.
-    outs = collect(outs, sim.frame_at(5, &mv(0, 501, 500)));
+    // baseline is at x=500 (the touchdown position); move +2 units (0.2mm,
+    // past the 0.1mm test deadzone) to arm and press, then back to 500 so
+    // the net motion is zero and the baseline/carry are exactly where the
+    // callers expect them.
+    outs = collect(outs, sim.frame_at(5, &mv(0, 502, 500)));
     outs = collect(outs, sim.frame_at(5, &mv(0, 500, 500)));
     outs
 }
@@ -461,6 +477,39 @@ fn slow_stationary_3finger_tap_middle_clicks() {
         synth_events(&outs).is_empty(),
         "nothing leaks to the compositor"
     );
+}
+
+/// THE UNRELIABILITY BUG: a resting finger always jitters by a fraction
+/// of a millimetre. Without a deadzone, whichever frame's noise happened
+/// to compute >=1px tripped the button press -- so the *same* tap
+/// middle-clicked sometimes and left-click-dragged other times, at random.
+/// Sub-threshold jitter (net or peak) must never arm the drag, so a
+/// stationary tap middle-clicks every single time.
+#[test]
+fn jittering_stationary_tap_still_middle_clicks() {
+    // 100 units/mm with a 0.5mm deadzone: the jitter below peaks at 0.03mm.
+    let mut sim = Sim::with_res_threshold(100.0, 0.5);
+    commit_drag_only(&mut sim); // committed at x=500, unpressed
+
+    // resting-finger noise around x=500: small back-and-forth, every
+    // excursion far under 0.5mm, netting ~zero
+    let mut outs = Vec::new();
+    for &x in &[503, 498, 501, 499, 502, 500, 497, 500] {
+        outs = collect(outs, sim.frame_at(5, &mv(0, x, 500)));
+    }
+    assert_eq!(
+        mouse_downs(&outs),
+        0,
+        "sub-threshold jitter must never arm a drag"
+    );
+
+    let outs = sim.frame_at(5, &cat(&[&up(0), &up(1), &up(2)]));
+    assert_eq!(
+        middle_clicks(&outs),
+        1,
+        "a jittery but stationary tap still middle-clicks"
+    );
+    assert_eq!(mouse_downs(&outs), 0, "and never a stray left click");
 }
 
 /// The flip side: a 3-finger touch that *moves* is a real drag -- left

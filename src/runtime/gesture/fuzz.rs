@@ -197,6 +197,7 @@ fn run_scenario(seed: u64, drag_end_delay_ms: u64) {
             drag_end_delay: Duration::from_millis(drag_end_delay_ms),
             press_grace: Duration::from_millis(75),
             px_per_mm: PX_PER_MM,
+            drag_start_mm: 0.5,
         },
         10.0,
         10.0,

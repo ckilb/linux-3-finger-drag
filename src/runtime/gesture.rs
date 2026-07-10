@@ -120,6 +120,15 @@ pub struct Timing {
     pub press_grace: Duration,
     /// Combined px-per-mm * user acceleration factor.
     pub px_per_mm: f64,
+    /// How far (in physical millimetres of finger travel) a committed
+    /// 3-finger touch must move before it counts as a drag and presses the
+    /// button. A resting finger always jitters by a fraction of a
+    /// millimetre; without this deadzone that noise randomly trips the
+    /// press and turns a stationary tap (which should middle-click) into a
+    /// left-button micro-drag. Net displacement is measured, so back-and-
+    /// forth jitter cancels out. Independent of `px_per_mm`/acceleration so
+    /// the physical threshold stays constant.
+    pub drag_start_mm: f64,
 }
 
 #[derive(Clone, Copy)]
@@ -160,6 +169,12 @@ pub struct GestureMachine {
     drag_last_pos: Option<(i32, i32)>,
     /// Sub-pixel motion carried between frames.
     carry: (f64, f64),
+    /// Net drag motion (in output px) accumulated while a committed touch
+    /// has not yet crossed the drag-start deadzone. Jitter of a resting
+    /// finger nets ~zero here and never arms the drag; real movement grows
+    /// it past the threshold. Reset when suppression begins and when the
+    /// drag arms.
+    premotion: (f64, f64),
 
     /// Last EV_KEY values seen from the REAL device (BTN_TOUCH,
     /// BTN_TOOL_*...). The truth about tool state on the pad.
@@ -200,6 +215,7 @@ impl GestureMachine {
             drag_ref_slot: None,
             drag_last_pos: None,
             carry: (0.0, 0.0),
+            premotion: (0.0, 0.0),
             real_keys: Vec::new(),
             clone_keys: Vec::new(),
             pending: Vec::new(),
@@ -663,6 +679,7 @@ impl GestureMachine {
         self.suppressing = true;
         self.lock_deadline = None; // a live drag owns the button now
         self.carry = (0.0, 0.0);
+        self.premotion = (0.0, 0.0);
 
         let mut release = Vec::new();
         for slot in 0..MAX_SLOTS {
@@ -717,17 +734,47 @@ impl GestureMachine {
 
         let (x, y) = (self.slots[reference].x, self.slots[reference].y);
         if let Some((lx, ly)) = self.drag_last_pos {
-            let px = (x - lx) as f64 / self.x_res * self.timing.px_per_mm + self.carry.0;
-            let py = (y - ly) as f64 / self.y_res * self.timing.px_per_mm + self.carry.1;
+            // this frame's motion in output px
+            let fx = (x - lx) as f64 / self.x_res * self.timing.px_per_mm;
+            let fy = (y - ly) as f64 / self.y_res * self.timing.px_per_mm;
+
+            if !self.held {
+                // Drag-start deadzone: don't press until the finger has
+                // physically moved past the threshold. A resting finger's
+                // jitter nets ~zero here, so a stationary tap never arms a
+                // drag (it lifts into a middle click instead). Net px /
+                // px_per_mm recovers the physical mm travelled, independent
+                // of the acceleration factor folded into px_per_mm.
+                self.premotion.0 += fx;
+                self.premotion.1 += fy;
+                let moved_mm =
+                    self.premotion.0.hypot(self.premotion.1) / self.timing.px_per_mm;
+                if moved_mm >= self.timing.drag_start_mm {
+                    // Crossed the threshold: this is a real drag. Press,
+                    // then apply the accumulated motion (nothing is lost --
+                    // the finger really did travel it) before continuing
+                    // frame-by-frame.
+                    self.press_button(out);
+                    let dx = self.premotion.0.trunc() as i32;
+                    let dy = self.premotion.1.trunc() as i32;
+                    self.carry = (self.premotion.0 - dx as f64, self.premotion.1 - dy as f64);
+                    self.premotion = (0.0, 0.0);
+                    if dx != 0 || dy != 0 {
+                        out.push(Output::MouseMove { dx, dy });
+                    }
+                }
+                self.drag_last_pos = Some((x, y));
+                return;
+            }
+
+            let px = fx + self.carry.0;
+            let py = fy + self.carry.1;
             let dx = px.trunc() as i32;
             let dy = py.trunc() as i32;
             // carry the sub-pixel remainder instead of discarding it, so
             // slow, precise drags don't systematically lose motion
             self.carry = (px - dx as f64, py - dy as f64);
             if dx != 0 || dy != 0 {
-                // real drag motion: the deferred press (if still pending)
-                // must land before the movement it accompanies
-                self.press_button(out);
                 out.push(Output::MouseMove { dx, dy });
             }
         } else {

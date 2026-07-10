@@ -103,6 +103,17 @@ pub struct Configuration {
     #[serde(default = "default_75ms")]
     #[serde_as(as = "serde_with::DurationMilliSeconds<u64>")]
     pub press_grace: Duration, // in milliseconds
+
+    // How far (in millimetres of physical finger travel) a committed
+    // 3-finger touch must move before it becomes a drag and presses the
+    // button. A resting finger always jitters by a fraction of a mm; this
+    // deadzone keeps that noise from randomly turning a stationary tap
+    // (which should middle-click) into a left-button micro-drag. Larger =
+    // more jitter-proof but a drag needs a bigger nudge to start; smaller =
+    // twitchier. Net displacement is measured, so back-and-forth jitter
+    // cancels rather than accumulating.
+    #[serde(default = "default_drag_start_mm")]
+    pub drag_start_threshold: f64, // in millimetres
 }
 
 impl Configuration {
@@ -115,6 +126,7 @@ impl Configuration {
             drag_end_delay: self.drag_end_delay,
             press_grace: self.press_grace,
             px_per_mm: PX_PER_MM * self.acceleration,
+            drag_start_mm: self.drag_start_threshold,
         }
     }
 }
@@ -129,6 +141,7 @@ impl Default for Configuration {
             entry_debounce: Duration::from_millis(50),
             probe_delay: Duration::from_millis(15),
             press_grace: Duration::from_millis(75),
+            drag_start_threshold: 0.5,
         }
     }
 }
@@ -151,6 +164,9 @@ fn default_75ms() -> Duration {
 }
 fn default_50ms() -> Duration {
     Duration::from_millis(50)
+}
+fn default_drag_start_mm() -> f64 {
+    0.5
 }
 fn default_stdout() -> String {
     "stdout".to_string()
@@ -276,6 +292,21 @@ impl Configuration {
                 "5000ms".into(),
             );
             self.drag_end_delay = Duration::from_millis(5000);
+        }
+        if !self.drag_start_threshold.is_finite() || self.drag_start_threshold < 0.0 {
+            fix(
+                "dragStartThreshold",
+                format!("{}", self.drag_start_threshold),
+                "0.5".into(),
+            );
+            self.drag_start_threshold = 0.5;
+        } else if self.drag_start_threshold > 10.0 {
+            fix(
+                "dragStartThreshold",
+                format!("{}", self.drag_start_threshold),
+                "10.0".into(),
+            );
+            self.drag_start_threshold = 10.0;
         }
         self
     }
