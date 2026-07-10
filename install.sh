@@ -85,14 +85,33 @@ echo
 # 
 # Neither of these are preferred security-wise (unless you trust my program), 
 # but it should solve the issue.
-echo -n "Installing binary to /usr/bin...                "
+# Determine the install location. On immutable / atomic distros (Fedora
+# Silverblue / Kinoite / Aurora / Bazzite, openSUSE MicroOS, etc.) /usr is a
+# read-only mount, so writing to /usr/bin fails. In that case we fall back to
+# the user's ~/.local/bin, which is writable and already on PATH. The SystemD
+# unit's ExecStart is generated to match the chosen path (see below).
+USER_HOME=$(getent passwd "$SUDO_USER" | cut -d: -f6)
+if touch /usr/bin/.3fd-write-test 2>/dev/null; then
+    rm -f /usr/bin/.3fd-write-test
+    INSTALL_DIR=/usr/bin
+else
+    INSTALL_DIR="$USER_HOME/.local/bin"
+fi
+BIN_PATH="$INSTALL_DIR/linux-3-finger-drag"
 
-# with the user added to the 'input' group, root does not need to
-# own the executable, and stick to the principle of least privilege.
-ERR_MSG=$(cp --preserve=ownership ./target/release/linux-3-finger-drag /usr/bin/ 2>&1)
+echo -n "Installing binary to $INSTALL_DIR... "
+
+# with the user added to the 'input' group, root does not need to own the
+# executable, so keep it owned by the user (principle of least privilege, and
+# required when installing into the user's home directory).
+if [[ $INSTALL_DIR == /usr/bin ]]; then
+    ERR_MSG=$(cp --preserve=ownership ./target/release/linux-3-finger-drag /usr/bin/ 2>&1)
+else
+    ERR_MSG=$(su "$SUDO_USER" -c "mkdir -p '$INSTALL_DIR' && cp '$REPO_DIR/target/release/linux-3-finger-drag' '$INSTALL_DIR'/" 2>&1)
+fi
 if [[ -n $ERR_MSG ]]; then
     echo -e "[\e[0;33m WARN \e[0m]"
-    echo -e "\e[0;33mWarning\e[0m: Could not install binary to /usr/bin:"
+    echo -e "\e[0;33mWarning\e[0m: Could not install binary to $INSTALL_DIR:"
     echo "    $ERR_MSG"
     echo "    This may cause issues with the SystemD service."
 else
@@ -116,13 +135,19 @@ echo -e "[\e[0;32m DONE \e[0m]"
 echo -n "Installing/enabling SystemD user unit...        "
 if ps -p 1 | grep -q systemd; then
 
-    # define user-level service
-    # made as non-root user
-    # shellcheck disable=SC2016  # $HOME must expand in the TARGET user's shell
-    su "$SUDO_USER" -c '\
-        mkdir -p "$HOME"/.config/systemd/user; \
-        cp three-finger-drag.service $HOME/.config/systemd/user/; \
-        systemctl --user enable --now three-finger-drag.service '
+    # define user-level service, made as the non-root user.
+    # - ExecStart is rewritten to the path the binary was actually installed to
+    #   (matters when we fell back to ~/.local/bin on an immutable distro).
+    # - XDG_RUNTIME_DIR must be set explicitly: `systemctl --user` invoked
+    #   through su has no session bus in its environment, which otherwise fails
+    #   with "Failed to connect to user scope bus via local transport".
+    USER_UID=$(id -u "$SUDO_USER")
+    su "$SUDO_USER" -c "\
+        mkdir -p \$HOME/.config/systemd/user; \
+        sed 's|^ExecStart=.*|ExecStart=$BIN_PATH|' '$REPO_DIR/three-finger-drag.service' > \$HOME/.config/systemd/user/three-finger-drag.service; \
+        export XDG_RUNTIME_DIR=/run/user/$USER_UID; \
+        systemctl --user daemon-reload; \
+        systemctl --user enable --now three-finger-drag.service"
     echo -e "[\e[0;32m DONE \e[0m]"
 
 else
