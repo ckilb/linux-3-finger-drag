@@ -46,6 +46,7 @@ pub fn start_handler() -> Result<VirtualTrackpad, std::io::Error> {
 
     uhandle.set_evbit(EventKind::Key)?;
     uhandle.set_keybit(Key::ButtonLeft)?;
+    uhandle.set_keybit(Key::ButtonMiddle)?;
 
     uhandle.set_evbit(EventKind::Relative)?;
     uhandle.set_relbit(RelativeAxis::X)?;
@@ -110,6 +111,31 @@ impl VirtualTrackpad {
         self.handle.write(&events)?;
         self.mouse_is_down = false;
         debug!("virtual mouse button released");
+        Ok(())
+    }
+
+    /// A complete middle-button click (press + release) at the current
+    /// pointer position -- a stationary 3-finger tap. Self-contained, so
+    /// it never interacts with the left-button drag state.
+    pub fn middle_click(&mut self) -> Result<(), std::io::Error> {
+        let events = [
+            InputEvent::from(KeyEvent::new(
+                VirtualTrackpad::ZERO,
+                Key::ButtonMiddle,
+                KeyState::pressed(true),
+            ))
+            .into_raw(),
+            Self::syn(),
+            InputEvent::from(KeyEvent::new(
+                VirtualTrackpad::ZERO,
+                Key::ButtonMiddle,
+                KeyState::pressed(false),
+            ))
+            .into_raw(),
+            Self::syn(),
+        ];
+        self.handle.write(&events)?;
+        debug!("virtual mouse middle-clicked");
         Ok(())
     }
 

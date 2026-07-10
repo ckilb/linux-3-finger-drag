@@ -89,6 +89,12 @@ pub enum Output {
     /// Move the cursor by whole pixels (fractional remainders are
     /// carried inside the machine so slow drags don't lose motion).
     MouseMove { dx: i32, dy: i32 },
+    /// A full middle-button click (press + release) at the current
+    /// pointer position: a stationary 3-finger tap -- the macOS/libinput
+    /// "three-finger tap = middle click" (paste). Owned here rather than
+    /// replayed to the compositor so it fires regardless of libinput's
+    /// tap-to-click config and never depends on a timing threshold.
+    MiddleClick,
 }
 
 /// The timing/scaling knobs the machine needs; derived from the user
@@ -105,13 +111,12 @@ pub struct Timing {
     /// motion after a drag can never smear the held button around
     /// (the exact regression the first drag-lock attempt shipped).
     pub drag_end_delay: Duration,
-    /// How long after a drag commits the button press is deferred when
-    /// the fingers haven't moved yet. The press fires at the first
-    /// actual drag motion or when this grace expires -- whichever comes
-    /// first -- so a 4th finger landing *after* the entry window (a
-    /// fast/sloppy 4-finger swipe, whose fingers stagger more the
-    /// faster the hand comes down) can abort the misclassified drag
-    /// without a phantom click ever having been sent.
+    /// Reserved / currently unused. A committed drag no longer presses
+    /// the button on any timer: the left button is pressed *only* by real
+    /// drag motion, so a 3-finger touch that never moves is a tap (and
+    /// gets a [`Output::MiddleClick`]), while a late 4th finger can always
+    /// abort cleanly because nothing was ever pressed. Kept as a config
+    /// knob for backward compatibility.
     pub press_grace: Duration,
     /// Combined px-per-mm * user acceleration factor.
     pub px_per_mm: f64,
@@ -155,9 +160,6 @@ pub struct GestureMachine {
     drag_last_pos: Option<(i32, i32)>,
     /// Sub-pixel motion carried between frames.
     carry: (f64, f64),
-    /// While a committed drag hasn't moved yet: when to press the button
-    /// anyway (see [`Timing::press_grace`]). Cleared once pressed.
-    press_deadline: Option<Instant>,
 
     /// Last EV_KEY values seen from the REAL device (BTN_TOUCH,
     /// BTN_TOOL_*...). The truth about tool state on the pad.
@@ -198,7 +200,6 @@ impl GestureMachine {
             drag_ref_slot: None,
             drag_last_pos: None,
             carry: (0.0, 0.0),
-            press_deadline: None,
             real_keys: Vec::new(),
             clone_keys: Vec::new(),
             pending: Vec::new(),
@@ -227,9 +228,9 @@ impl GestureMachine {
     /// land on time instead of on the next poll interval.
     pub fn next_deadline(&self) -> Option<Instant> {
         if self.suppressing {
-            // a committed drag that hasn't moved yet still owes a
-            // deferred button press
-            return if self.held { None } else { self.press_deadline };
+            // A committed drag is purely event-driven: it presses on the
+            // first real motion and ends on liftoff. Nothing is timed.
+            return None;
         }
         if let Some(start) = self.touch_start {
             if !self.settled {
@@ -251,15 +252,9 @@ impl GestureMachine {
     pub fn on_tick(&mut self, now: Instant) -> Vec<Output> {
         let mut out = Vec::new();
         if self.suppressing {
-            // Stationary drag: no motion has pressed the button yet, and
-            // no 4th finger has shown up to abort -- commit the press.
-            if !self.held {
-                if let Some(deadline) = self.press_deadline {
-                    if now >= deadline {
-                        self.press_button(&mut out);
-                    }
-                }
-            }
+            // A committed-but-unmoved drag waits for motion (which presses
+            // and drives it) or liftoff (a tap -> middle click). Both
+            // arrive as frames; there is no timed work to do here.
             return out;
         }
 
@@ -412,27 +407,37 @@ impl GestureMachine {
         // the moment they lift too.
         if self.suppressing {
             if count == 0 {
+                // The button is pressed only by real drag motion now, so
+                // `held` is the honest "did this actually become a drag"
+                // signal (or a drag-lock carryover from a previous drag).
+                let moved = self.held;
                 self.suppressing = false;
                 self.drag_ref_slot = None;
                 self.drag_last_pos = None;
-                self.press_deadline = None;
                 // Reset touch bookkeeping: without this the next touch
                 // would inherit touch_max/settled from this drag and
                 // skip the debounce protection entirely.
                 self.touch_start = None;
                 self.touch_max = 0;
                 self.settled = false;
-                // A committed drag that never moved and lifted before
-                // the press grace still owes its click: press now so the
-                // release below (or the drag-lock) completes it.
-                self.press_button(out);
-                if self.timing.drag_end_delay > Duration::ZERO {
-                    // Drag-lock: keep the button held; a new 3-finger
-                    // touch inside the window resumes the drag, anything
-                    // else releases it (see flush_pending / on_tick).
-                    self.lock_deadline = Some(now + self.timing.drag_end_delay);
+                if moved {
+                    // A real drag (or a drag-lock carryover) is ending.
+                    if self.timing.drag_end_delay > Duration::ZERO {
+                        // Drag-lock: keep the button held; a new 3-finger
+                        // touch inside the window resumes the drag,
+                        // anything else releases it (see flush_pending /
+                        // on_tick).
+                        self.lock_deadline = Some(now + self.timing.drag_end_delay);
+                    } else {
+                        self.release_button(out);
+                    }
                 } else {
-                    self.release_button(out);
+                    // Three fingers rested and lifted without ever moving:
+                    // that is a tap, not a drag. Emit the middle click it
+                    // deserves (macOS/libinput "3-finger tap = middle
+                    // click") instead of the stray LEFT click the old
+                    // deferred press produced.
+                    out.push(Output::MiddleClick);
                 }
                 // The synth clone has nothing active on it (suppression
                 // never relayed anything), so there's nothing to resync.
@@ -458,7 +463,6 @@ impl GestureMachine {
                 self.suppressing = false;
                 self.drag_ref_slot = None;
                 self.drag_last_pos = None;
-                self.press_deadline = None;
                 self.settled = true; // continues as an ordinary live touch
                 self.release_button(out);
                 // Introduce the touch to the clone as a fresh, complete,
@@ -484,13 +488,24 @@ impl GestureMachine {
 
         if count == 0 {
             let had_pending = self.touch_start.is_some() && !self.settled;
+            let touched_three = self.touch_max == 3;
             self.touch_start = None;
             self.touch_max = 0;
             self.settled = false;
             if had_pending {
-                // Touch ended before a decision was reached (e.g. a
-                // quick tap): flush everything buffered, including this
-                // release frame, so the tap isn't silently swallowed.
+                if touched_three {
+                    // A quick 3-finger tap that lifted before the decision
+                    // window closed. Don't leak the withheld touchdowns to
+                    // the compositor -- own the middle click ourselves so
+                    // it fires the same way a slower 3-finger tap does,
+                    // regardless of libinput's tap settings.
+                    self.pending.clear();
+                    out.push(Output::MiddleClick);
+                    return;
+                }
+                // A 1- or 2-finger quick tap: flush everything buffered,
+                // including this release frame, so libinput does the
+                // ordinary left/right tap-click (and nothing is swallowed).
                 self.pending.extend_from_slice(frame);
                 self.flush_pending(out);
                 return;
@@ -572,17 +587,16 @@ impl GestureMachine {
         self.flush_pending(out);
     }
 
-    /// Commit the current touch as a 3-finger drag. The button press is
-    /// DEFERRED: it fires at the first actual drag motion, or when
-    /// press_grace expires -- so a late 4th finger (fast 4-finger swipe)
-    /// can still abort without a phantom click having been sent.
-    fn commit_drag(&mut self, active: &[usize], now: Instant, out: &mut Vec<Output>) {
+    /// Commit the current touch as a 3-finger drag. NO button press is
+    /// made here: the left button is pressed only by the first actual drag
+    /// motion (see [`Self::drive_drag`]). A committed touch that never
+    /// moves is therefore a tap -- it lifts into a [`Output::MiddleClick`]
+    /// -- and a late 4th finger (fast 4-finger swipe) can always abort
+    /// with no phantom click, because nothing was ever pressed.
+    fn commit_drag(&mut self, active: &[usize], _now: Instant, out: &mut Vec<Output>) {
         debug!("3-finger touch committed as a drag");
         self.settled = true;
         self.enter_suppress(out);
-        if !self.held {
-            self.press_deadline = Some(now + self.timing.press_grace);
-        }
         self.drive_drag(active, out);
     }
 
@@ -674,7 +688,6 @@ impl GestureMachine {
     fn press_button(&mut self, out: &mut Vec<Output>) {
         if !self.held {
             self.held = true;
-            self.press_deadline = None;
             out.push(Output::MouseDown);
         }
         // if still held from a drag-lock, the drag just resumes --

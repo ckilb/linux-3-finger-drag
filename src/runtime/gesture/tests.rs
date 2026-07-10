@@ -90,6 +90,12 @@ fn mouse_ups(outs: &[Output]) -> usize {
     outs.iter().filter(|o| matches!(o, Output::MouseUp)).count()
 }
 
+fn middle_clicks(outs: &[Output]) -> usize {
+    outs.iter()
+        .filter(|o| matches!(o, Output::MiddleClick))
+        .count()
+}
+
 fn synth_events(outs: &[Output]) -> Vec<Ev> {
     outs.iter()
         .filter_map(|o| match o {
@@ -112,12 +118,18 @@ fn collect(mut acc: Vec<Output>, more: Vec<Output>) -> Vec<Output> {
     acc
 }
 
-/// Drive a full staggered 3-finger touchdown into a committed drag,
-/// then let the press grace expire so the button is actually pressed.
-/// Returns everything emitted along the way.
+/// Drive a full staggered 3-finger touchdown into a committed drag, then
+/// actually press the button. The button is now pressed only by real drag
+/// motion, so we nudge the reference finger out and back: net-zero motion
+/// (baseline and carry return to where they started) but a genuine
+/// MouseDown along the way -- exactly the "active, pressed drag" state the
+/// callers depend on. Returns everything emitted along the way.
 fn start_drag(sim: &mut Sim) -> Vec<Output> {
     let mut outs = commit_drag_only(sim);
-    outs = collect(outs, sim.tick(80)); // press grace expires -> MouseDown
+    // baseline is at x=500 (the touchdown position); +1 unit then -1 unit
+    // presses on the first motion and leaves the baseline back at 500.
+    outs = collect(outs, sim.frame_at(5, &mv(0, 501, 500)));
+    outs = collect(outs, sim.frame_at(5, &mv(0, 500, 500)));
     outs
 }
 
@@ -150,11 +162,12 @@ fn staggered_3finger_touchdown_becomes_drag_without_leaking() {
     );
 }
 
-/// A quick 3-finger tap (ends before the debounce window) is NOT a drag:
-/// it must be replayed to the compositor byte-identically so 3-finger
-/// tap (middle-click paste) keeps working.
+/// A quick 3-finger tap (ends before the debounce window) is NOT a drag
+/// and NOT a left click: it is the macOS/libinput "3-finger tap = middle
+/// click". We own that click rather than leaking the withheld touchdowns
+/// to the compositor, so it fires regardless of libinput's tap settings.
 #[test]
-fn quick_3finger_tap_replays_verbatim() {
+fn quick_3finger_tap_middle_clicks() {
     let mut sim = Sim::new();
     let f1 = cat(&[
         &down(0, 1, 100, 100),
@@ -166,15 +179,12 @@ fn quick_3finger_tap_replays_verbatim() {
     let mut outs = sim.frame(&f1);
     outs = collect(outs, sim.frame_at(25, &f2)); // all up at 25ms < 50ms
 
-    assert_eq!(mouse_downs(&outs), 0, "a tap must not start a drag");
-    let mut expected = f1.clone();
-    expected.push(Ev::syn());
-    expected.extend(f2);
-    expected.push(Ev::syn());
-    assert_eq!(
-        synth_events(&outs),
-        expected,
-        "tap must be replayed exactly as it happened"
+    assert_eq!(mouse_downs(&outs), 0, "a tap must not start a left drag");
+    assert_eq!(middle_clicks(&outs), 1, "a 3-finger tap is a middle click");
+    assert!(
+        synth_events(&outs).is_empty(),
+        "the withheld touchdowns must never reach the compositor, got {:?}",
+        synth_events(&outs)
     );
 }
 
@@ -418,44 +428,56 @@ fn deferred_press_lands_before_first_motion() {
     );
 }
 
-/// A stationary 3-finger hold must still press (after the grace) so
-/// press-and-hold semantics survive the deferral...
+/// A stationary 3-finger hold that never moves must NOT press the left
+/// button -- no timer does that anymore. Holding still is not a drag.
 #[test]
-fn stationary_hold_presses_after_grace() {
+fn stationary_hold_never_left_presses() {
     let mut sim = Sim::new();
     let outs = commit_drag_only(&mut sim);
-    assert_eq!(mouse_downs(&outs), 0);
-    let outs = sim.tick(80); // grace (75ms) expires
-    assert_eq!(
-        mouse_downs(&outs),
-        1,
-        "stationary drag must press after the grace"
+    assert_eq!(mouse_downs(&outs), 0, "commit alone must not press");
+    // however long it rests, an unmoved hold stays unpressed
+    let outs = sim.tick(200);
+    assert_eq!(mouse_downs(&outs), 0, "a motionless hold is not a left drag");
+    assert_eq!(middle_clicks(&outs), 0, "nothing fires until liftoff");
+}
+
+/// THE BUG THIS FIX ADDRESSES: a 3-finger tap that lingers past the
+/// debounce window (an ordinary human tap is easily >50ms) used to commit
+/// as a drag and emit a stray LEFT click on liftoff, stealing the normal
+/// middle click. It must middle-click instead -- regardless of how long
+/// the fingers rested -- as long as they never moved.
+#[test]
+fn slow_stationary_3finger_tap_middle_clicks() {
+    let mut sim = Sim::new();
+    commit_drag_only(&mut sim); // committed after the 50ms debounce
+    let outs = sim.tick(60); // rest well past the old 75ms grace...
+    assert_eq!(mouse_downs(&outs), 0, "still no left press while resting");
+
+    let outs = sim.frame_at(20, &cat(&[&up(0), &up(1), &up(2)])); // ...then lift
+    assert_eq!(middle_clicks(&outs), 1, "an unmoved 3-finger tap is a middle click");
+    assert_eq!(mouse_downs(&outs), 0, "and never a left click");
+    assert_eq!(mouse_ups(&outs), 0);
+    assert!(
+        synth_events(&outs).is_empty(),
+        "nothing leaks to the compositor"
     );
 }
 
-/// ...and a stationary 3-finger touch that lifts before the grace still
-/// produces its click (press+release at liftoff), preserving the old
-/// "3-finger hold = click" behavior.
+/// The flip side: a 3-finger touch that *moves* is a real drag -- left
+/// button held, cursor driven, released on liftoff -- and never a middle
+/// click. This is the discriminator: motion, not time.
 #[test]
-fn stationary_hold_lifting_before_grace_still_clicks() {
+fn moving_3finger_touch_is_a_left_drag_not_a_middle_click() {
     let mut sim = Sim::new();
     commit_drag_only(&mut sim);
-    let outs = sim.frame_at(20, &cat(&[&up(0), &up(1), &up(2)])); // lift inside grace
-    assert_eq!(
-        mouse_downs(&outs),
-        1,
-        "the owed click must be pressed at liftoff"
-    );
-    assert_eq!(mouse_ups(&outs), 1, "and released");
-    let d = outs
-        .iter()
-        .position(|o| matches!(o, Output::MouseDown))
-        .unwrap();
-    let u = outs
-        .iter()
-        .position(|o| matches!(o, Output::MouseUp))
-        .unwrap();
-    assert!(d < u);
+    let outs = sim.frame_at(10, &mv(0, 520, 500)); // motion commits the press
+    assert_eq!(mouse_downs(&outs), 1, "motion presses the left button");
+    let (dx, _) = total_move(&outs);
+    assert!(dx > 0, "and drives the cursor");
+
+    let outs = sim.frame_at(10, &cat(&[&up(0), &up(1), &up(2)]));
+    assert_eq!(mouse_ups(&outs), 1, "liftoff releases the drag");
+    assert_eq!(middle_clicks(&outs), 0, "a moving drag is never a middle click");
 }
 
 // =========================================================================
@@ -803,13 +825,11 @@ fn next_deadline_tracks_state() {
 
     let mut sim = Sim::new();
     commit_drag_only(&mut sim);
-    let d = sim
-        .m
-        .next_deadline()
-        .expect("press-grace deadline while unmoved");
-    assert_eq!(d, sim.now + Duration::from_millis(75));
-    sim.tick(80); // grace fires -> pressed
-    assert_eq!(sim.m.next_deadline(), None, "dragging: purely event-driven");
+    assert_eq!(
+        sim.m.next_deadline(),
+        None,
+        "a committed drag is purely event-driven -- no timed press"
+    );
 
     let mut sim = Sim::with_delay(300);
     start_drag(&mut sim);

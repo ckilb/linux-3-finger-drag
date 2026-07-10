@@ -220,6 +220,9 @@ fn run_scenario(seed: u64, drag_end_delay_ms: u64) {
                     *expect_held = false;
                 }
                 Output::MouseMove { .. } => {}
+                // A self-contained middle-button click: it never touches
+                // the left-button drag state the invariants track.
+                Output::MiddleClick => {}
             }
         }
     };

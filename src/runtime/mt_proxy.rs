@@ -289,6 +289,7 @@ impl MtProxy {
                 Output::MouseDown => vtp.mouse_down()?,
                 Output::MouseUp => vtp.mouse_up()?,
                 Output::MouseMove { dx, dy } => vtp.mouse_move_relative(*dx, *dy)?,
+                Output::MiddleClick => vtp.middle_click()?,
             }
         }
         Ok(())
