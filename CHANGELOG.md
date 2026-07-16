@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- Three-finger taps with a late-landing second or third finger no longer leak
+  a transient two-finger tap to libinput and randomly produce a right-click.
+  Stationary first fingers now remain buffered for the full classification
+  window, while intentional one-finger pointer motion keeps the short response
+  path.
+
 ## 2.0.0 - 2026-07-06
 
 Architecture rewrite: the program is now an evdev multitouch proxy
@@ -234,4 +244,3 @@ state machine and an event-driven runtime. Fixes #18. Courtesy of [Juao Driessen
 ## Added
 
 - Add support for `XDG_HOME` (contributed by @Diegovsky)
-

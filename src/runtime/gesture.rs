@@ -18,10 +18,10 @@
 //!   tracked as a whole -- never judged frame-by-frame, because real
 //!   fingers land and lift asynchronously.
 //! * A fresh touch is *buffered* (withheld from the compositor) until it
-//!   is classified: a lone finger settles after a short `probe_delay`
-//!   (so ordinary pointer motion never feels delayed), an ambiguous 2-3
-//!   finger touch waits out `entry_debounce`, and reaching 4+ fingers
-//!   settles it instantly (nothing with 4 fingers is ours).
+//!   is classified: a lone finger showing intentional pointer motion settles
+//!   after a short `probe_delay` (so pointer use never feels delayed), a
+//!   stationary or ambiguous 1-3 finger touch waits out `entry_debounce`, and
+//!   reaching 4+ fingers settles it instantly (nothing with 4 fingers is ours).
 //! * A touch that holds at exactly 3 fingers through the debounce window
 //!   becomes a drag: buffered frames are discarded, the compositor never
 //!   learns those fingers existed, and finger motion drives the virtual
@@ -54,6 +54,12 @@ pub const MAX_SLOTS: usize = 16;
 /// 12.0 (4.0 x the initial guess) is the value confirmed to feel right
 /// live on the MacBookPro11,3 pad.
 pub const PX_PER_MM: f64 = 12.0;
+
+/// A lone touchdown only takes the fast pointer path once it has moved this
+/// far. Resting-finger noise must not expose the touch before fingers two and
+/// three have had the full entry window to land; doing so briefly presents a
+/// two-finger tap to libinput, which becomes a phantom right-click.
+const POINTER_START_MM: f64 = 0.5;
 
 /// A raw evdev event stripped to the fields that matter. Mirrors
 /// `input_event` minus the timestamp (the kernel re-stamps everything
@@ -191,6 +197,10 @@ pub struct GestureMachine {
     /// being classified.
     pending: Vec<Ev>,
     touch_start: Option<Instant>,
+    /// Position of the first finger at touchdown. A stationary lone finger
+    /// remains ambiguous until `entry_debounce`; intentional pointer motion
+    /// past [`POINTER_START_MM`] may take the short `probe_delay` path.
+    probe_origin: Option<(usize, i32, i32, i32)>, // slot, tracking id, x, y
     touch_max: usize,
     settled: bool,
 
@@ -220,6 +230,7 @@ impl GestureMachine {
             clone_keys: Vec::new(),
             pending: Vec::new(),
             touch_start: None,
+            probe_origin: None,
             touch_max: 0,
             settled: false,
             held: false,
@@ -250,7 +261,7 @@ impl GestureMachine {
         }
         if let Some(start) = self.touch_start {
             if !self.settled {
-                let window = if self.touch_max <= 1 {
+                let window = if self.touch_max <= 1 && self.probe_has_moved() {
                     self.timing.probe_delay
                 } else {
                     self.timing.entry_debounce
@@ -291,7 +302,11 @@ impl GestureMachine {
         let count = self.active_count();
         let start = self.touch_start.expect("guarded by is_none() above");
 
-        if count == 1 && self.touch_max == 1 && now >= start + self.timing.probe_delay {
+        if count == 1
+            && self.touch_max == 1
+            && self.probe_has_moved()
+            && now >= start + self.timing.probe_delay
+        {
             self.settled = true;
             self.flush_pending(&mut out);
             return out;
@@ -362,6 +377,7 @@ impl GestureMachine {
             // (rare) truncated tap instead; consistency wins.
             self.pending.clear();
             self.touch_start = None;
+            self.probe_origin = None;
             self.touch_max = 0;
         } else {
             // The synthetic device (or the buffer of a still-undecided
@@ -434,6 +450,7 @@ impl GestureMachine {
                 // would inherit touch_max/settled from this drag and
                 // skip the debounce protection entirely.
                 self.touch_start = None;
+                self.probe_origin = None;
                 self.touch_max = 0;
                 self.settled = false;
                 if moved {
@@ -506,6 +523,7 @@ impl GestureMachine {
             let had_pending = self.touch_start.is_some() && !self.settled;
             let touched_three = self.touch_max == 3;
             self.touch_start = None;
+            self.probe_origin = None;
             self.touch_max = 0;
             self.settled = false;
             if had_pending {
@@ -538,6 +556,10 @@ impl GestureMachine {
             self.touch_max = count;
             self.settled = false;
             self.pending.clear();
+            self.probe_origin = active.first().map(|&slot| {
+                let finger = self.slots[slot];
+                (slot, finger.tracking_id, finger.x, finger.y)
+            });
         } else {
             self.touch_max = self.touch_max.max(count);
         }
@@ -573,7 +595,11 @@ impl GestureMachine {
 
         let start = self.touch_start.expect("set above when the touch began");
 
-        if count == 1 && self.touch_max == 1 && now >= start + self.timing.probe_delay {
+        if count == 1
+            && self.touch_max == 1
+            && self.probe_has_moved()
+            && now >= start + self.timing.probe_delay
+        {
             // Still just one finger after a short probe: ordinary
             // pointer movement, by far the most common case. Go live now
             // rather than waiting out the full entry_debounce, or every
@@ -601,6 +627,23 @@ impl GestureMachine {
         }
         self.settled = true;
         self.flush_pending(out);
+    }
+
+    /// Whether the first finger has moved far enough to clearly be pointer
+    /// motion rather than a stationary finger waiting for the rest of a
+    /// multi-finger touchdown. This preserves the 15ms pointer response while
+    /// keeping stationary taps protected for the full entry debounce window.
+    fn probe_has_moved(&self) -> bool {
+        let Some((slot, tracking_id, x, y)) = self.probe_origin else {
+            return false;
+        };
+        let finger = self.slots[slot];
+        if finger.tracking_id != tracking_id {
+            return false;
+        }
+        let dx_mm = (finger.x - x) as f64 / self.x_res;
+        let dy_mm = (finger.y - y) as f64 / self.y_res;
+        dx_mm.hypot(dy_mm) >= POINTER_START_MM
     }
 
     /// Commit the current touch as a 3-finger drag. NO button press is
@@ -747,8 +790,7 @@ impl GestureMachine {
                 // of the acceleration factor folded into px_per_mm.
                 self.premotion.0 += fx;
                 self.premotion.1 += fy;
-                let moved_mm =
-                    self.premotion.0.hypot(self.premotion.1) / self.timing.px_per_mm;
+                let moved_mm = self.premotion.0.hypot(self.premotion.1) / self.timing.px_per_mm;
                 if moved_mm >= self.timing.drag_start_mm {
                     // Crossed the threshold: this is a real drag. Press,
                     // then apply the accumulated motion (nothing is lost --

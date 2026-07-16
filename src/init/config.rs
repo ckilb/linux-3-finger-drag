@@ -83,13 +83,11 @@ pub struct Configuration {
     #[serde_as(as = "serde_with::DurationMilliSeconds<u64>")]
     pub entry_debounce: Duration, // in milliseconds
 
-    // How long a touch that starts (and so far stays) at exactly 1 finger
-    // is held back before being relayed live. Deliberately much shorter
-    // than entry_debounce: ordinary single-finger pointer movement is by
-    // far the most common gesture, including the touch-lift-reposition
-    // cycle people use to cover long distances on a small trackpad, so it
-    // must never feel delayed. This only needs to be long enough to catch
-    // a 2nd finger landing a beat behind the 1st.
+    // How long a touch that starts at exactly 1 finger and shows intentional
+    // pointer motion is held back before being relayed live. A stationary
+    // first finger remains protected for entry_debounce so late-landing
+    // fingers two and three cannot leak to libinput as a right-click. This
+    // shorter motion path keeps ordinary pointer use responsive.
     #[serde(default = "default_15ms")]
     #[serde_as(as = "serde_with::DurationMilliSeconds<u64>")]
     pub probe_delay: Duration, // in milliseconds

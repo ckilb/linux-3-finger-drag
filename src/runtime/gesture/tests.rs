@@ -270,8 +270,9 @@ fn four_finger_liftoff_through_three_is_not_hijacked() {
     );
 }
 
-/// A lone finger settles after the short probe and is then live --
-/// ordinary pointer movement must never feel debounced.
+/// A lone finger with intentional pointer motion settles after the short
+/// probe and is then live -- ordinary pointer movement must never feel
+/// debounced.
 #[test]
 fn one_finger_settles_after_probe_then_relays_live() {
     let mut sim = Sim::new();
@@ -281,7 +282,13 @@ fn one_finger_settles_after_probe_then_relays_live() {
         "still inside the probe window"
     );
 
-    let outs = sim.tick(15);
+    let outs = sim.frame_at(5, &mv(0, 106, 100)); // 0.6mm: intentional motion
+    assert!(
+        synth_events(&outs).is_empty(),
+        "still inside the 15ms probe"
+    );
+
+    let outs = sim.tick(10);
     assert!(
         !synth_events(&outs).is_empty(),
         "probe over: buffered touch flushes"
@@ -294,6 +301,45 @@ fn one_finger_settles_after_probe_then_relays_live() {
         4,
         "live motion must relay instantly"
     );
+}
+
+/// THE PHANTOM RIGHT-CLICK RACE: the first finger of a 3-finger tap can
+/// rest longer than the short pointer probe before the other two land. If
+/// that stationary finger is exposed at 15ms, the second finger is exposed
+/// too, and withdrawing both when the third arrives makes libinput emit a
+/// 2-finger tap (right-click). A stationary first finger must remain buffered
+/// for the full entry window so the complete tap is owned as a middle click.
+#[test]
+fn late_landing_stationary_3finger_tap_never_leaks_as_right_click() {
+    let mut sim = Sim::new();
+    let mut outs = sim.frame(&down(0, 1, 100, 100));
+    outs = collect(outs, sim.tick(15));
+    assert!(
+        synth_events(&outs).is_empty(),
+        "stationary first finger must remain protected after probe"
+    );
+
+    outs = collect(outs, sim.frame_at(7, &down(1, 2, 200, 100)));
+    outs = collect(outs, sim.frame_at(7, &down(2, 3, 300, 100)));
+    outs = collect(outs, sim.frame_at(10, &cat(&[&up(0), &up(1), &up(2)])));
+
+    assert_eq!(middle_clicks(&outs), 1, "3-finger tap must middle-click");
+    assert!(
+        synth_events(&outs).is_empty(),
+        "no 1- or 2-finger prefix may reach libinput: {:?}",
+        synth_events(&outs)
+    );
+}
+
+/// A stationary one-finger hold still becomes live; it merely uses the full
+/// classification window because there was no pointer motion proving that it
+/// could not be the start of a staggered multi-finger tap.
+#[test]
+fn stationary_one_finger_settles_at_entry_debounce() {
+    let mut sim = Sim::new();
+    sim.frame(&down(0, 7, 100, 100));
+    assert!(synth_events(&sim.tick(49)).is_empty());
+    assert!(!synth_events(&sim.tick(1)).is_empty());
 }
 
 /// Two fingers landing staggered (a scroll) must flush after the
@@ -328,7 +374,8 @@ fn growth_to_three_after_settle_becomes_drag_with_clean_release() {
     let mut sim = Sim::new();
     let f = cat(&[&down(0, 1, 100, 100), &[Ev::new(EV_KEY, BTN_TOUCH, 1)][..]]);
     sim.frame(&f);
-    sim.tick(15); // settles as 1-finger, flushed live (incl. BTN_TOUCH=1)
+    sim.frame_at(5, &mv(0, 106, 100)); // intentional pointer motion
+    sim.tick(10); // settles as 1-finger, flushed live (incl. BTN_TOUCH=1)
 
     let mut outs = sim.frame_at(10, &cat(&[&down(1, 2, 200, 100), &down(2, 3, 300, 100)]));
     let evs = synth_events(&outs);
@@ -453,7 +500,11 @@ fn stationary_hold_never_left_presses() {
     assert_eq!(mouse_downs(&outs), 0, "commit alone must not press");
     // however long it rests, an unmoved hold stays unpressed
     let outs = sim.tick(200);
-    assert_eq!(mouse_downs(&outs), 0, "a motionless hold is not a left drag");
+    assert_eq!(
+        mouse_downs(&outs),
+        0,
+        "a motionless hold is not a left drag"
+    );
     assert_eq!(middle_clicks(&outs), 0, "nothing fires until liftoff");
 }
 
@@ -470,7 +521,11 @@ fn slow_stationary_3finger_tap_middle_clicks() {
     assert_eq!(mouse_downs(&outs), 0, "still no left press while resting");
 
     let outs = sim.frame_at(20, &cat(&[&up(0), &up(1), &up(2)])); // ...then lift
-    assert_eq!(middle_clicks(&outs), 1, "an unmoved 3-finger tap is a middle click");
+    assert_eq!(
+        middle_clicks(&outs),
+        1,
+        "an unmoved 3-finger tap is a middle click"
+    );
     assert_eq!(mouse_downs(&outs), 0, "and never a left click");
     assert_eq!(mouse_ups(&outs), 0);
     assert!(
@@ -526,7 +581,11 @@ fn moving_3finger_touch_is_a_left_drag_not_a_middle_click() {
 
     let outs = sim.frame_at(10, &cat(&[&up(0), &up(1), &up(2)]));
     assert_eq!(mouse_ups(&outs), 1, "liftoff releases the drag");
-    assert_eq!(middle_clicks(&outs), 0, "a moving drag is never a middle click");
+    assert_eq!(
+        middle_clicks(&outs),
+        0,
+        "a moving drag is never a middle click"
+    );
 }
 
 // =========================================================================
@@ -680,9 +739,10 @@ fn drag_lock_releases_before_relaying_other_touches() {
     start_drag(&mut sim);
     sim.frame_at(30, &cat(&[&up(0), &up(1), &up(2)]));
 
-    // one finger lands and settles inside the lock window
+    // one finger lands, moves, and settles inside the lock window
     let mut outs = sim.frame_at(50, &down(0, 70, 100, 100));
-    outs = collect(outs, sim.tick(15));
+    outs = collect(outs, sim.frame_at(5, &mv(0, 106, 100)));
+    outs = collect(outs, sim.tick(10));
 
     assert_eq!(mouse_ups(&outs), 1, "lock must break for a non-drag touch");
     // ordering: MouseUp strictly before the flushed touch events
@@ -813,7 +873,7 @@ fn resync_with_all_lifted_during_pending_swallows_cleanly() {
     // and the machine is fully usable afterwards
     let outs = sim.frame_at(10, &down(0, 9, 100, 100));
     assert!(synth_events(&outs).is_empty()); // buffered, fresh touch
-    let outs = sim.tick(15);
+    let outs = sim.tick(50);
     assert!(!synth_events(&outs).is_empty()); // settles normally
 }
 
@@ -853,24 +913,26 @@ fn small_slot_count_has_no_phantom_slots() {
     assert_eq!(m2.slot_count, 5);
 }
 
-/// next_deadline steers the event loop: probe deadline for a lone
-/// finger, debounce deadline once ambiguous, none while dragging or
-/// idle, lock deadline while a lock is pending.
+/// next_deadline steers the event loop: debounce deadline for a stationary
+/// lone finger, short probe deadline after pointer motion, none while dragging
+/// or idle, and the lock deadline while a lock is pending.
 #[test]
 fn next_deadline_tracks_state() {
     let mut sim = Sim::new();
     assert_eq!(sim.m.next_deadline(), None, "idle: nothing scheduled");
 
     sim.frame(&down(0, 1, 100, 100));
-    let d = sim.m.next_deadline().expect("probe deadline");
-    assert_eq!(d, sim.now + Duration::from_millis(15));
+    let touch_start = sim.now;
+    let d = sim.m.next_deadline().expect("stationary debounce deadline");
+    assert_eq!(d, touch_start + Duration::from_millis(50));
+
+    sim.frame_at(5, &mv(0, 106, 100));
+    let d = sim.m.next_deadline().expect("pointer probe deadline");
+    assert_eq!(d, touch_start + Duration::from_millis(15));
 
     sim.frame_at(5, &down(1, 2, 200, 100));
     let d = sim.m.next_deadline().expect("debounce deadline");
-    assert_eq!(
-        d,
-        sim.now - Duration::from_millis(5) + Duration::from_millis(50)
-    );
+    assert_eq!(d, touch_start + Duration::from_millis(50));
 
     let mut sim = Sim::new();
     commit_drag_only(&mut sim);
@@ -897,7 +959,7 @@ fn non_mt_events_ride_along_with_their_frames() {
     let mut sim = Sim::new();
     let f = cat(&[&down(0, 1, 100, 100), &[Ev::new(EV_KEY, BTN_TOUCH, 1)][..]]);
     sim.frame(&f);
-    let outs = sim.tick(15);
+    let outs = sim.tick(50);
     assert!(
         synth_events(&outs).contains(&Ev::new(EV_KEY, BTN_TOUCH, 1)),
         "key events must flush with their touch"
